@@ -97,6 +97,8 @@ SELFTEST_REGEX = re.compile(r'(Okay|[EW]\d{3}):\s(.*)')
 ERRORCODE_REGEX = re.compile(r'[EW]\d{3}')
 DOCSTRING_REGEX = re.compile(r'u?r?["\']')
 EXTRANEOUS_WHITESPACE_REGEX = re.compile(r'[[({] | []}),;:]')
+EXTRANEOUS_WHITESPACE_REGEX_BEFORE = re.compile(r'\s+[]}),;:]')
+EXTRANEOUS_WHITESPACE_REGEX_AFTER = re.compile(r'[[({]\s+')
 WHITESPACE_AFTER_COMMA_REGEX = re.compile(r'[,;:]\s*(?:  |\t)')
 COMPARE_SINGLETON_REGEX = re.compile(r'([=!]=)\s*(None|False|True)')
 COMPARE_TYPE_REGEX = re.compile(r'([=!]=|is|is\s+not)\s*type(?:s\.(\w+)Type'
@@ -117,7 +119,7 @@ COMMENT_WITH_NL = tokenize.generate_tokens(['#\n'].pop).send(None)[1] == '#\n'
 ##############################################################################
 
 
-def tabs_or_spaces(physical_line, indent_char):
+def tabs_or_spaces(physical_line, line_number, indent_char):
     r"""
     Never mix tabs and spaces.
 
@@ -134,10 +136,12 @@ def tabs_or_spaces(physical_line, indent_char):
     indent = INDENT_REGEX.match(physical_line).group(1)
     for offset, char in enumerate(indent):
         if char != indent_char:
-            return offset, "E101 indentation contains mixed spaces and tabs"
+            highlights = [[line_number, 0, line_number, len(indent) - 1]]
+            return (offset, highlights,
+                    "E101 indentation contains mixed spaces and tabs")
 
 
-def tabs_obsolete(physical_line):
+def tabs_obsolete(physical_line, line_number):
     r"""
     For new projects, spaces-only are strongly recommended over tabs.  Most
     editors have features that make this easy to do.
@@ -147,10 +151,11 @@ def tabs_obsolete(physical_line):
     """
     indent = INDENT_REGEX.match(physical_line).group(1)
     if '\t' in indent:
-        return indent.index('\t'), "W191 indentation contains tabs"
+        highlights = [[line_number, 0, line_number, len(indent) - 1]]
+        return indent.index('\t'), highlights, "W191 indentation contains tabs"
 
 
-def trailing_whitespace(physical_line):
+def trailing_whitespace(physical_line, line_number):
     r"""
     JCR: Trailing whitespace is superfluous.
     FBM: Except when it occurs as part of a blank line (i.e. the line is
@@ -174,10 +179,12 @@ def trailing_whitespace(physical_line):
     physical_line = physical_line.rstrip('\x0c')  # chr(12), form feed, ^L
     stripped = physical_line.rstrip(' \t\v')
     if physical_line != stripped:
+        highlights = [[line_number, len(stripped),
+                       line_number, len(physical_line) - 1]]
         if stripped:
-            return len(stripped), "W291 trailing whitespace"
+            return len(stripped), highlights, "W291 trailing whitespace"
         else:
-            return 0, "W293 blank line contains whitespace"
+            return 0, highlights, "W293 blank line contains whitespace"
 
 
 def trailing_blank_lines(physical_line, lines, line_number):
@@ -188,7 +195,7 @@ def trailing_blank_lines(physical_line, lines, line_number):
     W391: spam(1)\n
     """
     if not physical_line.rstrip() and line_number == len(lines):
-        return 0, "W391 blank line at end of file"
+        return 0, [], "W391 blank line at end of file"
 
 
 def missing_newline(physical_line):
@@ -198,10 +205,10 @@ def missing_newline(physical_line):
     Reports warning W292.
     """
     if physical_line.rstrip() == physical_line:
-        return len(physical_line), "W292 no newline at end of file"
+        return len(physical_line), [], "W292 no newline at end of file"
 
 
-def maximum_line_length(physical_line, max_line_length):
+def maximum_line_length(physical_line, line_number, max_line_length):
     """
     Limit all lines to a maximum of 79 characters.
 
@@ -226,7 +233,9 @@ def maximum_line_length(physical_line, max_line_length):
             except UnicodeError:
                 pass
         if length > max_line_length:
-            return (max_line_length, "E501 line too long "
+            highlights = [[line_number, max_line_length,
+                           line_number, length - 1]]
+            return (max_line_length, highlights, "E501 line too long "
                     "(%d > %d characters)" % (length, max_line_length))
 
 
@@ -261,19 +270,19 @@ def blank_lines(logical_line, blank_lines, indent_level, line_number,
         return  # Don't expect blank lines before the first line
     if previous_logical.startswith('@'):
         if blank_lines:
-            yield 0, "E304 blank lines found after function decorator"
+            yield 0, [], "E304 blank lines found after function decorator"
     elif blank_lines > 2 or (indent_level and blank_lines == 2):
-        yield 0, "E303 too many blank lines (%d)" % blank_lines
+        yield 0, [], "E303 too many blank lines (%d)" % blank_lines
     elif logical_line.startswith(('def ', 'class ', '@')):
         if indent_level:
             if not (blank_lines or previous_indent_level < indent_level or
                     DOCSTRING_REGEX.match(previous_logical)):
-                yield 0, "E301 expected 1 blank line, found 0"
+                yield 0, [], "E301 expected 1 blank line, found 0"
         elif blank_lines != 2:
-            yield 0, "E302 expected 2 blank lines, found %d" % blank_lines
+            yield 0, [], "E302 expected 2 blank lines, found %d" % blank_lines
 
 
-def extraneous_whitespace(logical_line):
+def extraneous_whitespace(logical_line, line_number):
     """
     Avoid extraneous whitespace in the following situations:
 
@@ -294,19 +303,27 @@ def extraneous_whitespace(logical_line):
     E203: if x == 4 : print x, y; x, y = y, x
     """
     line = logical_line
-    for match in EXTRANEOUS_WHITESPACE_REGEX.finditer(line):
+
+    for match in EXTRANEOUS_WHITESPACE_REGEX_AFTER.finditer(line):
         text = match.group()
         char = text.strip()
         found = match.start()
-        if text == char + ' ':
-            # assert char in '([{'
-            yield found + 1, "E201 whitespace after '%s'" % char
-        elif line[found - 1] != ',':
+        highlights = [[line_number, found + 1,
+                       line_number, found + len(text) - len(char)]]
+        yield found + 1, highlights, "E201 whitespace after '%s'" % char
+
+    for match in EXTRANEOUS_WHITESPACE_REGEX_BEFORE.finditer(line):
+        text = match.group()
+        char = text.strip()
+        found = match.start()
+        if line[found - 1] != ',':
             code = ('E202' if char in '}])' else 'E203')  # if char in ',;:'
-            yield found, "%s whitespace before '%s'" % (code, char)
+            highlights = [[line_number, found,
+                           line_number, found + len(text) - len(char) - 1]]
+            yield found, highlights, "%s whitespace before '%s'" % (code, char)
 
 
-def whitespace_around_keywords(logical_line):
+def whitespace_around_keywords(logical_line, line_number):
     r"""
     Avoid extraneous whitespace around keywords.
 
@@ -320,17 +337,29 @@ def whitespace_around_keywords(logical_line):
         before, after = match.groups()
 
         if '\t' in before:
-            yield match.start(1), "E274 tab before keyword"
+            offset = match.start(1)
+            highlights = [[line_number, offset,
+                           line_number, offset + len(before) - 1]]
+            yield offset, highlights, "E274 tab before keyword"
         elif len(before) > 1:
-            yield match.start(1), "E272 multiple spaces before keyword"
+            offset = match.start(1)
+            highlights = [[line_number, offset,
+                           line_number, offset + len(before) - 1]]
+            yield offset, highlights, "E272 multiple spaces before keyword"
 
         if '\t' in after:
-            yield match.start(2), "E273 tab after keyword"
+            offset = match.start(2)
+            highlights = [[line_number, offset,
+                           line_number, offset + len(after) - 1]]
+            yield offset, highlights, "E273 tab after keyword"
         elif len(after) > 1:
-            yield match.start(2), "E271 multiple spaces after keyword"
+            offset = match.start(2)
+            highlights = [[line_number, offset,
+                           line_number, offset + len(after) - 1]]
+            yield offset, highlights, "E271 multiple spaces after keyword"
 
 
-def missing_whitespace(logical_line):
+def missing_whitespace(logical_line, line_number):
     """
     JCR: Each comma, semicolon or colon should be followed by whitespace.
 
@@ -354,11 +383,13 @@ def missing_whitespace(logical_line):
                 continue  # Slice syntax, no space required
             if char == ',' and line[index + 1] == ')':
                 continue  # Allow tuple with only one element: (3,)
-            yield index, "E231 missing whitespace after '%s'" % char
+            highlights = [[line_number, index, line_number, index]]
+            yield (index, highlights,
+                   "E231 missing whitespace after '%s'" % char)
 
 
 def indentation(logical_line, previous_logical, indent_char,
-                indent_level, previous_indent_level):
+                indent_level, previous_indent_level, line_number):
     r"""
     Use 4 spaces per indentation level.
 
@@ -375,13 +406,14 @@ def indentation(logical_line, previous_logical, indent_char,
     Okay: a = 1\nb = 2
     E113: a = 1\n    b = 2
     """
+    highlights = [[line_number, -indent_level, line_number, -1]]
     if indent_char == ' ' and indent_level % 4:
-        yield 0, "E111 indentation is not a multiple of four"
+        yield 0, highlights, "E111 indentation is not a multiple of four"
     indent_expect = previous_logical.endswith(':')
     if indent_expect and indent_level <= previous_indent_level:
-        yield 0, "E112 expected an indented block"
+        yield 0, highlights, "E112 expected an indented block"
     if indent_level > previous_indent_level and not indent_expect:
-        yield 0, "E113 unexpected indentation"
+        yield 0, highlights, "E113 unexpected indentation"
 
 
 def continuation_line_indentation(logical_line, tokens, indent_level, verbose):
@@ -468,11 +500,13 @@ def continuation_line_indentation(logical_line, tokens, indent_level, verbose):
                 # this line starts with a closing bracket
                 if indent[depth]:
                     if start[1] != indent[depth]:
-                        yield (start, 'E124 closing bracket does not match '
-                               'visual indentation')
+                        highlights = [[start[0], 0, start[0], start[1] - 1]]
+                        yield (start, highlights, 'E124 closing bracket does '
+                               'not match visual indentation')
                 elif hang:
-                    yield (start, 'E123 closing bracket does not match '
-                           'indentation of opening bracket\'s line')
+                    highlights = [[start[0], 0, start[0], start[1] - 1]]
+                    yield (start, highlights, 'E123 closing bracket does not '
+                           'match indentation of opening bracket\'s line')
             elif visual_indent is True:
                 # visual indent is verified
                 if not indent[depth]:
@@ -482,13 +516,18 @@ def continuation_line_indentation(logical_line, tokens, indent_level, verbose):
                 pass
             elif indent[depth] and start[1] < indent[depth]:
                 # visual indent is broken
-                yield (start, 'E128 continuation line '
+                highlights = [[start[0], 0, start[0], start[1] - 1]]
+                yield (start, highlights, 'E128 continuation line '
                        'under-indented for visual indent')
             elif hang == 4 or (indent_next and rel_indent[row] == 8):
                 # hanging indent is verified
                 pass
             else:
                 # indent is broken
+                if start[1] > 0:
+                    highlights = [[start[0], 0, start[0], start[1] - 1]]
+                else:
+                    highlights = []
                 if hang <= 0:
                     error = 'E122', 'missing indentation or outdented'
                 elif indent[depth]:
@@ -497,7 +536,7 @@ def continuation_line_indentation(logical_line, tokens, indent_level, verbose):
                     error = 'E121', 'indentation is not a multiple of four'
                 else:
                     error = 'E126', 'over-indented for hanging indent'
-                yield start, "%s continuation line %s" % error
+                yield start, highlights, "%s continuation line %s" % error
 
         # look for visual indenting
         if (parens[row] and token_type not in (tokenize.NL, tokenize.COMMENT)
@@ -544,8 +583,9 @@ def continuation_line_indentation(logical_line, tokens, indent_level, verbose):
         last_token_multiline = (start[0] != end[0])
 
     if indent_next and rel_indent[-1] == 4:
-        yield (last_indent, "E125 continuation line does not distinguish "
-               "itself from next logical line")
+        highlights = [[last_indent[0], 0, last_indent[0], last_indent[1] - 1]]
+        yield (last_indent, highlights, "E125 continuation line does not "
+               "distinguish itself from next logical line")
 
 
 def whitespace_before_parameters(logical_line, tokens):
@@ -578,13 +618,15 @@ def whitespace_before_parameters(logical_line, tokens):
             (index < 2 or tokens[index - 2][1] != 'class') and
                 # Allow "return (a.foo for a in range(5))"
                 not keyword.iskeyword(prev_text)):
-            yield prev_end, "E211 whitespace before '%s'" % text
+            highlights = [[prev_end[0], prev_end[1],
+                           prev_end[0], start[1] - 1]]
+            yield prev_end, highlights, "E211 whitespace before '%s'" % text
         prev_type = token_type
         prev_text = text
         prev_end = end
 
 
-def whitespace_around_operator(logical_line):
+def whitespace_around_operator(logical_line, line_number):
     r"""
     Avoid extraneous whitespace in the following situations:
 
@@ -601,14 +643,24 @@ def whitespace_around_operator(logical_line):
         before, after = match.groups()
 
         if '\t' in before:
-            yield match.start(1), "E223 tab before operator"
+            highlights = [[line_number, match.start(1),
+                           line_number, match.start(1) + len(before) - 1]]
+            yield match.start(1), [], "E223 tab before operator"
         elif len(before) > 1:
-            yield match.start(1), "E221 multiple spaces before operator"
+            highlights = [[line_number, match.start(1),
+                           line_number, match.start(1) + len(before) - 1]]
+            yield (match.start(1), highlights,
+                   "E221 multiple spaces before operator")
 
         if '\t' in after:
-            yield match.start(2), "E224 tab after operator"
+            highlights = [[line_number, match.start(2),
+                           line_number, match.start(2) + len(after) - 1]]
+            yield (match.start(2), highlights, "E224 tab after operator")
         elif len(after) > 1:
-            yield match.start(2), "E222 multiple spaces after operator"
+            highlights = [[line_number, match.start(2),
+                           line_number, match.start(2) + len(after) - 1]]
+            yield (match.start(2), highlights,
+                   "E222 multiple spaces after operator")
 
 
 def missing_whitespace_around_operator(logical_line, tokens):
@@ -662,7 +714,7 @@ def missing_whitespace_around_operator(logical_line, tokens):
             if start != prev_end:
                 # Found a (probably) needed space
                 if need_space is not True and not need_space[1]:
-                    yield (need_space[0],
+                    yield (need_space[0], [],
                            "E225 missing whitespace around operator")
                 need_space = False
             elif text == '>' and prev_text in ('<', '-'):
@@ -672,9 +724,14 @@ def missing_whitespace_around_operator(logical_line, tokens):
             else:
                 if need_space is True or need_space[1]:
                     # A needed trailing space was not found
-                    yield prev_end, "E225 missing whitespace around operator"
+                    highlights = [[prev_end[0], prev_end[1] - len(prev_text),
+                                   prev_end[0], prev_end[1] - 1]]
+                    yield (prev_end, highlights,
+                           "E225 missing whitespace around operator")
                 else:
-                    yield (need_space[0],
+                    highlights = [[prev_end[0], prev_end[1] - len(prev_text),
+                                   prev_end[0], prev_end[1] - 1]]
+                    yield (need_space[0], highlights,
                            "E226 missing optional whitespace around operator")
                 need_space = False
         elif token_type == tokenize.OP and prev_end is not None:
@@ -708,7 +765,10 @@ def missing_whitespace_around_operator(logical_line, tokens):
                 need_space = (prev_end, start != prev_end)
             elif need_space and start == prev_end:
                 # A needed opening space was not found
-                yield prev_end, "E225 missing whitespace around operator"
+                highlights = [[prev_end[0], prev_end[1],
+                               prev_end[0], prev_end[1] + len(text) - 1]]
+                yield (prev_end, highlights,
+                       "E225 missing whitespace around operator")
                 need_space = False
         prev_type = token_type
         prev_text = text
@@ -732,9 +792,9 @@ def whitespace_around_comma(logical_line):
     for m in WHITESPACE_AFTER_COMMA_REGEX.finditer(line):
         found = m.start() + 1
         if '\t' in m.group():
-            yield found, "E242 tab after '%s'" % m.group()[0]
+            yield found, [], "E242 tab after '%s'" % m.group()[0]
         else:
-            yield found, "E241 multiple spaces after '%s'" % m.group()[0]
+            yield found, [], "E241 multiple spaces after '%s'" % m.group()[0]
 
 
 def whitespace_around_named_parameter_equals(logical_line, tokens):
@@ -759,7 +819,8 @@ def whitespace_around_named_parameter_equals(logical_line, tokens):
         if no_space:
             no_space = False
             if start != prev_end:
-                yield (prev_end,
+                highlights = [list(prev_end + prev_end)]
+                yield (prev_end, highlights,
                        "E251 no spaces around keyword / parameter equals")
         elif token_type == tokenize.OP:
             if text == '(':
@@ -769,7 +830,8 @@ def whitespace_around_named_parameter_equals(logical_line, tokens):
             elif parens and text == '=':
                 no_space = True
                 if start != prev_end:
-                    yield (prev_end,
+                    highlights = [list(prev_end + prev_end)]
+                    yield (prev_end, highlights,
                            "E251 no spaces around keyword / parameter equals")
         prev_end = end
 
@@ -794,11 +856,19 @@ def whitespace_before_inline_comment(logical_line, tokens):
             if not line[:start[1]].strip():
                 continue
             if prev_end[0] == start[0] and start[1] < prev_end[1] + 2:
-                yield (prev_end,
+                if prev_end[1] < start[1]:
+                    highlights = [[prev_end[0], prev_end[1],
+                                   prev_end[0], start[1] - 1]]
+                else:
+                    highlights = []
+                yield (prev_end, highlights,
                        "E261 at least two spaces before inline comment")
             symbol, sp, comment = text.partition(' ')
             if symbol not in ('#', '#:') or comment[:1].isspace():
-                yield start, "E262 inline comment should start with '# '"
+                highlights = [[start[0], start[1],
+                               start[0], start[1] + len(symbol) - 1]]
+                yield (start, highlights,
+                       "E262 inline comment should start with '# '")
         elif token_type != tokenize.NL:
             prev_end = end
 
@@ -820,10 +890,10 @@ def imports_on_separate_lines(logical_line):
     if line.startswith('import '):
         found = line.find(',')
         if -1 < found and ';' not in line[:found]:
-            yield found, "E401 multiple imports on one line"
+            yield found, [], "E401 multiple imports on one line"
 
 
-def compound_statements(logical_line):
+def compound_statements(logical_line, line_number):
     r"""
     Compound statements (multiple statements on the same line) are
     generally discouraged.
@@ -858,13 +928,14 @@ def compound_statements(logical_line):
             before.count('[') <= before.count(']') and  # [1:2] (slice)
             before.count('(') <= before.count(')') and  # (Python 3 annotation)
                 not LAMBDA_REGEX.search(before)):       # lambda x: x
-            yield found, "E701 multiple statements on one line (colon)"
+            yield found, [], "E701 multiple statements on one line (colon)"
     found = line.find(';')
     if -1 < found:
         if found < last_char:
-            yield found, "E702 multiple statements on one line (semicolon)"
+            yield found, [], "E702 multiple statements on one line (semicolon)"
         else:
-            yield found, "E703 statement ends with a semicolon"
+            highlights = [[line_number, found, line_number, found]]
+            yield found, highlights, "E703 statement ends with a semicolon"
 
 
 def explicit_line_join(logical_line, tokens):
@@ -886,7 +957,9 @@ def explicit_line_join(logical_line, tokens):
     prev_start = prev_end = parens = 0
     for token_type, text, start, end, line in tokens:
         if start[0] != prev_start and parens and backslash:
-            yield backslash, "E502 the backslash is redundant between brackets"
+            highlights = [list(backslash + backslash)]
+            yield (backslash, highlights,
+                   "E502 the backslash is redundant between brackets")
         if end[0] != prev_end:
             if line.rstrip('\r\n').endswith('\\'):
                 backslash = (end[0], len(line.splitlines()[-1]) - 1)
@@ -902,7 +975,7 @@ def explicit_line_join(logical_line, tokens):
                 parens -= 1
 
 
-def comparison_to_singleton(logical_line):
+def comparison_to_singleton(logical_line, line_number):
     """
     Comparisons to singletons like None should always be done
     with "is" or "is not", never the equality operators.
@@ -928,11 +1001,13 @@ def comparison_to_singleton(logical_line):
             nonzero = ((singleton == 'True' and same) or
                        (singleton == 'False' and not same))
             msg += " or 'if %scond:'" % ('' if nonzero else 'not ')
-        yield match.start(1), ("%s comparison to %s should be %s" %
-                               (code, singleton, msg))
+        highlights = [[line_number, match.start(1),
+                       line_number, match.start(1) + len(match.group(1)) - 1]]
+        yield match.start(1), highlights, ("%s comparison to %s should be %s" %
+                                           (code, singleton, msg))
 
 
-def comparison_type(logical_line):
+def comparison_type(logical_line, line_number):
     """
     Object type comparisons should always use isinstance() instead of
     comparing types directly.
@@ -952,10 +1027,13 @@ def comparison_type(logical_line):
         inst = match.group(3)
         if inst and isidentifier(inst) and inst not in SINGLETONS:
             return  # Allow comparison for types which are not obvious
-        yield match.start(1), "E721 do not compare types, use 'isinstance()'"
+        highlights = [[line_number, match.start(),
+                       line_number, match.start() + len(match.group()) - 1]]
+        yield (match.start(1), highlights,
+               "E721 do not compare types, use 'isinstance()'")
 
 
-def python_3000_has_key(logical_line):
+def python_3000_has_key(logical_line, line_number):
     r"""
     The {}.has_key() method is removed in the Python 3.
     Use the 'in' operation instead.
@@ -965,7 +1043,8 @@ def python_3000_has_key(logical_line):
     """
     pos = logical_line.find('.has_key(')
     if pos > -1:
-        yield pos, "W601 .has_key() is deprecated, use 'in'"
+        highlights = [[line_number, pos + 1, line_number, pos + 7]]
+        yield pos, highlights, "W601 .has_key() is deprecated, use 'in'"
 
 
 def python_3000_raise_comma(logical_line):
@@ -983,10 +1062,10 @@ def python_3000_raise_comma(logical_line):
     """
     match = RAISE_COMMA_REGEX.match(logical_line)
     if match and not RERAISE_COMMA_REGEX.match(logical_line):
-        yield match.start(1), "W602 deprecated form of raising exception"
+        yield match.start(1), [], "W602 deprecated form of raising exception"
 
 
-def python_3000_not_equal(logical_line):
+def python_3000_not_equal(logical_line, line_number):
     """
     != can also be written <>, but this is an obsolete usage kept for
     backwards compatibility only. New code should always use !=.
@@ -997,7 +1076,8 @@ def python_3000_not_equal(logical_line):
     """
     pos = logical_line.find('<>')
     if pos > -1:
-        yield pos, "W603 '<>' is deprecated, use '!='"
+        highlights = [[line_number, pos, line_number, pos + 1]]
+        yield pos, highlights, "W603 '<>' is deprecated, use '!='"
 
 
 def python_3000_backticks(logical_line):
@@ -1010,7 +1090,7 @@ def python_3000_backticks(logical_line):
     """
     pos = logical_line.find('`')
     if pos > -1:
-        yield pos, "W604 backticks are deprecated, use 'repr()'"
+        yield pos, [], "W604 backticks are deprecated, use 'repr()'"
 
 
 ##############################################################################
@@ -1233,8 +1313,9 @@ class Checker(object):
         for name, check, argument_names in self._physical_checks:
             result = self.run_check(check, argument_names)
             if result is not None:
-                offset, text = result
-                self.report_error(self.line_number, offset, text, check)
+                offset, highlights, text = result
+                self.report_error(self.line_number, offset, highlights,
+                                  text, check)
 
     def build_tokens_line(self):
         """
@@ -1287,20 +1368,46 @@ class Checker(object):
             if self.verbose >= 4:
                 print('   ' + name)
             for result in self.run_check(check, argument_names):
-                offset, text = result
+                offset, highlights, text = result
                 if isinstance(offset, tuple):
                     orig_number, orig_offset = offset
+                    orig_highlights = highlights
                 else:
+                    orig_highlights = [h[:] for h in highlights]
                     for token_offset, token in self.mapping:
                         if offset >= token_offset:
                             orig_number = token[2][0]
                             orig_offset = (token[2][1] + offset - token_offset)
-                self.report_error(orig_number, orig_offset, text, check)
+                        for n, highlight in enumerate(highlights):
+                            if highlight[1] >= token_offset:
+                                orig_highlights[n][0] = token[2][0]
+                                orig_highlights[n][1] = (
+                                    token[2][1] + highlight[1] - token_offset)
+                            if highlight[3] >= token_offset:
+                                orig_highlights[n][2] = token[2][0]
+                                orig_highlights[n][3] = (
+                                    token[2][1] + highlight[3] - token_offset)
+                    for orig_highlight in orig_highlights:
+                        if orig_highlight[1] < 0:
+                            orig_highlight[0] = orig_number
+                            orig_highlight[1] += orig_offset
+                        if orig_highlight[3] < 0:
+                            orig_highlight[2] = orig_number
+                            orig_highlight[3] += orig_offset
+                    if orig_highlights:
+                        orig_number_start = min(
+                            map(lambda x: x[0], orig_highlights))
+                        orig_number_stop = max(
+                            map(lambda x: x[2], orig_highlights))
+                        if orig_number_start != orig_number_stop:
+                            orig_number = [orig_number_start, orig_number_stop]
+                self.report_error(orig_number, orig_offset, orig_highlights,
+                                  text, check)
         self.previous_logical = self.logical_line
 
     def generate_tokens(self):
         if self._io_error:
-            self.report_error(1, 0, 'E902 %s' % self._io_error, readlines)
+            self.report_error(1, 0, [], 'E902 %s' % self._io_error, readlines)
         tokengen = tokenize.generate_tokens(self.readline_check_physical)
         try:
             for token in tokengen:
@@ -1310,7 +1417,7 @@ class Checker(object):
             offset = exc.args[1]
             if len(offset) > 2:
                 offset = offset[1:3]
-            self.report_error(offset[0], offset[1],
+            self.report_error(offset[0], offset[1], [],
                               'E901 %s: %s' % (exc_type.__name__, exc.args[0]),
                               self.generate_tokens)
     generate_tokens.__doc__ = "    Check if the syntax is valid."
@@ -1399,7 +1506,7 @@ class BaseReport(object):
         """Signal a new logical line."""
         self.counters['logical lines'] += 1
 
-    def error(self, line_number, offset, text, check):
+    def error(self, line_number, offset, highlights, text, check):
         """Report an error, according to options."""
         code = text[:4]
         if self._ignore_code(code):
@@ -1470,17 +1577,17 @@ class StandardReport(BaseReport):
         self._show_source = options.show_source
         self._show_pep8 = options.show_pep8
 
-    def error(self, line_number, offset, text, check):
+    def error(self, line_number, offset, highlights, text, check):
         """
         Report an error, according to options.
         """
         code = super(StandardReport, self).error(line_number, offset,
-                                                 text, check)
+                                                 highlights, text, check)
         if code and (self.counters[code] == 1 or self._repeat):
             print(self._fmt % {
                 'path': self.filename,
                 'row': self.line_offset + line_number, 'col': offset + 1,
-                'code': code, 'text': text[5:],
+                'code': code, 'text': text[5:], 'highlights': highlights,
             })
             if self._show_source:
                 if line_number > len(self.lines):
